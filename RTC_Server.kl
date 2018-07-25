@@ -1,0 +1,539 @@
+PROGRAM RTC_Server
+-------------------------------------------------------------------------------
+-- This program provide server for run-time robot controll.
+--
+-- Assumptions:
+--	 - KAREL (R632) is supported by robot
+--   - User Socket Messaging (R648) is supported by robot
+--   - There is only 1 motion group
+--   - The TP program 'RTC_MOVE' exists on the robot
+-- 
+-- Configuration defaults:
+--   - TAG 'S3' used for USM
+--   - Relay TCP port 4000
+--   - Position register 1 is available
+--   - Integer registers 1, 2 are available
+--   - Flags 1, 2, 3 are available
+--   - Motion termination is at CNT, value = R[2]
+-- 
+-- Author: Makarov Dmitry (BMSTU)
+-------------------------------------------------------------------------------
+%RWACCESS
+%STACKSIZE = 4000
+%NOLOCKGROUP
+%NOPAUSE = ERROR + COMMAND + TPENABLE
+%NOPAUSESHFT
+%COMMENT = 'Run-time'
+
+%ENVIRONMENT UIF
+%ENVIRONMENT SYSDEF
+%ENVIRONMENT MEMO
+%ENVIRONMENT KCLOP
+%ENVIRONMENT BYNAM
+%ENVIRONMENT FDEV
+%ENVIRONMENT FLBT
+%ENVIRONMENT STRNG
+%ENVIRONMENT REGOPE
+
+%INCLUDE klevccdf
+%INCLUDE klevkeys
+%INCLUDE klevkmsk
+-------------------------------------------------------------------------------
+-- Constants and variables
+-------------------------------------------------------------------------------
+CONST
+	-- Used resources
+	SM_TAG_NUM	= '3'
+	SM_PORT_NUM	= 4000
+	POS_R		= 1
+	SPEED_R		= 1
+	TERM_R		= 2
+	TP_READY_F	= 1
+	TP_MOVED_F	= 2
+	TP_LPOS_F	= 3
+	
+	-- Status codes
+	S_SUCCESS	= 0 		-- Success status
+	EOM			= 'EOM'		-- End of moving marker
+	MOV			= 40		-- Moving cmd
+	EOS			= 99		-- End of session marker
+	
+	-- Error codes
+	POS_UR		= 100 		-- Position unreachable
+	INCOR_VAL   = 105		-- Incorrect value of variable
+VAR
+	sm_tag 		: STRING[3]
+	sockfd 		: FILE
+	entry 		: INTEGER	-- Variable number (need for setting sys var-s)
+	status		: INTEGER	-- Error checking
+	
+-------------------------------------------------------------------------------
+-- Local routine prototypes
+-------------------------------------------------------------------------------
+ROUTINE spaces_clr 		(src: STRING) 						FROM RTC_Server
+ROUTINE info_str 		(result_str: STRING) 				FROM RTC_Server
+ROUTINE axisnum_str 	(result_str: STRING) 	: INTEGER  	FROM RTC_Server
+ROUTINE axislim_str 	(result_str: STRING; axis_index: INTEGER; &
+							type_spec : STRING)				FROM RTC_Server
+ROUTINE send_info 		(sockfd: FILE) 			: INTEGER	FROM RTC_Server
+ROUTINE moving_task 	(sockfd: FILE) 			: INTEGER	FROM RTC_Server
+ROUTINE server_cycle	(sockfd: FILE)						FROM RTC_Server
+
+-------------------------------------------------------------------------------
+-- Main program
+-------------------------------------------------------------------------------
+BEGIN
+	-- Start user notifications
+	WRITE(CHR(137), CHR(128))				-- Clear the TP USER menu screen
+	FORCE_SPMENU(TP_PANEL, SPI_TPUSER, 1) 	-- Force the TP USER menu to be
+											-- visible
+	WRITE('Starting RTC Server..', CR)
+	
+	-- Set Interactively write for socket, ASCII-format
+	SET_FILE_ATR(sockfd, ATR_IA)
+
+	-- Set the server port before doing a connect
+	sm_tag = 'S'+ SM_TAG_NUM + ':'
+	SET_VAR(entry, '*SYSTEM*', '$HOSTS_CFG['+ SM_TAG_NUM +'].$SERVER_PORT', &
+				SM_PORT_NUM, status)
+	IF (status <> S_SUCCESS) THEN
+		WRITE('Port setting Failed, Status = ', status, CR)
+		GOTO error_label
+	ENDIF
+
+	-- Clear possible connection
+	MSG_DISCO(sm_tag, status)
+	WRITE('Port setting success.', CR)
+		
+	-- Start server
+	WHILE (TRUE) DO 
+		-- Session with one client
+		WRITE('Wait for connecting to '+ sm_tag +'..', CR)
+		MSG_CONNECT(sm_tag, status)
+		IF (status <> S_SUCCESS) THEN
+			WRITE('Connecting Failed, Status = ', status, CR)
+			GOTO error_label
+		ENDIF
+		
+		-- Clear the TP USER menu screen
+		WRITE(CHR(137), CHR(128))
+		WRITE('Connected.', CR)
+		
+		-- Open socket for r/w 
+		OPEN FILE sockfd ('RW', sm_tag)
+		status = IO_STATUS(sockfd)
+		IF (status <> S_SUCCESS) THEN
+			WRITE('Socket opening Failed, Status = ', status, CR)
+			GOTO error_label
+		ENDIF
+		
+		server_cycle(sockfd)
+		
+		CLOSE FILE sockfd
+		WRITE('Disconnecting..', CR)
+		MSG_DISCO(sm_tag, status)
+	ENDWHILE	
+	
+error_label::	
+	WRITE('Program finished with error', CR)
+	
+END RTC_Server
+
+
+-------------------------------------------------------------------------------
+-- This routine perform main cycle of server
+-- 
+-- [in    ] sockfd 		: socket descriptor
+-------------------------------------------------------------------------------
+ROUTINE server_cycle
+VAR
+	status		: INTEGER
+	n_bytes		: INTEGER
+	cmd			: INTEGER
+	
+BEGIN
+	-- Send robot info string
+	status = send_info(sockfd)
+	
+	WRITE('Start session', CR)
+	cmd = 0
+	WHILE (TRUE) DO
+
+		-- Wait for command
+		WHILE (n_bytes <= 0) DO
+			BYTES_AHEAD(sockfd, n_bytes, status)
+		ENDWHILE
+		READ sockfd (cmd)
+		
+		SELECT (cmd) OF
+			CASE (MOV):
+				-- Perform moving
+				status = moving_task(sockfd)
+			CASE (EOS):
+				WRITE('End session', CR)
+				RETURN
+		ENDSELECT	
+	ENDWHILE
+	
+END server_cycle
+
+-------------------------------------------------------------------------------
+-- This function sends info about robot
+-- 
+-- [in    ] sockfd 		: socket descriptor
+-- [out   ] 			: status
+-------------------------------------------------------------------------------
+ROUTINE send_info
+VAR
+	buffer 	: STRING[128]
+	entry 	: INTEGER
+	status	: INTEGER
+	axisnum : INTEGER
+	i		: INTEGER
+	
+BEGIN
+	-- Send info string
+	info_str(buffer)
+	WRITE sockfd (buffer, CR)
+--	status = IO_STATUS(sockfd)
+--	IF (status <> S_SUCCESS) THEN
+--		WRITE('Socket operation Failed, Status = ', status, CR)
+--		RETURN (-status)
+--	ENDIF
+	
+	-- Send axisnum string
+	axisnum = axisnum_str(buffer)
+	WRITE sockfd (buffer, CR)
+
+	-- Send limits: L, next U
+	FOR i = 1 TO axisnum DO
+		axislim_str(buffer, i, 'L')
+		WRITE sockfd (buffer, CR)
+		axislim_str(buffer, i, 'U')
+		WRITE sockfd (buffer, CR)
+	ENDFOR
+	
+	-- Send number of rows in the menu and rows next
+	WRITE sockfd (3, CR)
+	WRITE sockfd ('Available moving commands (Type, Coords, Speed):', CR)
+	WRITE sockfd ('Joint  moving: J 6-reals 1-int', CR)
+	WRITE sockfd ('Linear moving: L 6-reals 1-int', CR)
+	
+	RETURN (S_SUCCESS)
+	
+END send_info
+
+
+-------------------------------------------------------------------------------
+-- This function receive point and perform moving
+-- 
+-- [in    ] sockfd 		: socket descriptor
+-- [out   ] 			: status
+-------------------------------------------------------------------------------
+ROUTINE moving_task
+VAR
+	buffer 		: STRING[128]
+	entry 		: INTEGER
+	status		: INTEGER
+	flag		: BOOLEAN
+	n_bytes		: INTEGER
+	i			: INTEGER
+	
+	point_type	: STRING[1]
+	coords		: ARRAY[6] OF REAL
+	j_pos		: JOINTPOS6
+	lin_cfg		: CONFIG
+	lin_pos		: XYZWPR
+	speed		: INTEGER
+	term		: INTEGER
+	
+BEGIN
+	n_bytes = 0;
+	WRITE('Start moving task', CR)
+	
+	-- Ready to motion
+	WRITE sockfd (TRUE, CR)
+	
+	-- Receieving type of motion
+	WHILE (n_bytes <= 0) DO
+		BYTES_AHEAD(sockfd, n_bytes, status)
+	ENDWHILE
+	
+	READ sockfd (point_type::1)
+	WRITE('Type = ', point_type, CR)
+	
+	IF (point_type = 'J') THEN
+		-- Joint moving
+		FLG[TP_LPOS_F] = OFF
+		
+		-- Receieving coordinates
+		WHILE (n_bytes < 6) DO
+			BYTES_AHEAD(sockfd, n_bytes, status)
+		ENDWHILE
+		
+		FOR i = 1 TO 6 DO
+			READ sockfd (coords[i])
+		ENDFOR
+		CNV_REL_JPOS(coords, j_pos, status)
+		WRITE(j_pos, CR)
+		flag = J_IN_RANGE(j_pos)
+		WRITE sockfd (flag, CR)
+		
+		IF (flag <> TRUE) THEN
+			WRITE('Position unreachable',CR)
+			RETURN (POS_UR)
+		ENDIF
+		
+		-- Receieving speed
+		WHILE (n_bytes <= 0) DO
+			BYTES_AHEAD(sockfd, n_bytes, status)
+		ENDWHILE	
+		
+		READ sockfd (speed)
+		WRITE('Speed = ', speed, CR)
+
+		-- Receieving termination
+		WHILE (n_bytes <= 0) DO
+			BYTES_AHEAD(sockfd, n_bytes, status)
+		ENDWHILE	
+		
+		READ sockfd (term)
+		WRITE('Termination = CNT', term, CR)
+		
+		-- sync with TPE program
+		WAIT FOR (FLG[TP_READY_F] = ON)
+		WRITE('Moving..', CR)
+		
+		-- Saving registers
+		-- Set position
+		SET_JPOS_REG(POS_R, j_pos, status)
+		IF (status <> S_SUCCESS) THEN 
+			RETURN (-status)
+		ENDIF
+		
+		-- Set speed
+		SET_INT_REG(SPEED_R, speed, status)
+		IF (status <> S_SUCCESS) THEN 
+			RETURN (-status)
+		ENDIF
+		
+		-- Set termination
+		SET_INT_REG(TERM_R, term, status)
+		IF (status <> S_SUCCESS) THEN 
+			RETURN (-status)
+		ENDIF
+		
+		-- Execute
+		FLG[TP_MOVED_F] = ON
+		WAIT FOR (FLG[TP_MOVED_F] = OFF)
+		WRITE('Moving done.', CR)
+		
+		-- Send report
+		WRITE sockfd (EOM, CR)
+		
+		-- Send current position
+		j_pos = CURJPOS(0, 0)
+		CNV_JPOS_REL(j_pos, coords, status)
+		FOR i = 1 TO 6 DO
+			WRITE sockfd (coords[i], CR)
+		ENDFOR
+		WRITE('Report sended.', CR)
+		
+		
+	ELSE IF (point_type = 'L') THEN
+		-- Linear moving
+		FLG[TP_LPOS_F] = ON
+		
+		-- Setting up default configuration
+		USING lin_cfg DO
+			CFG_TURN_NO1	= 0
+			CFG_TURN_NO2	= 0
+			CFG_TURN_NO3	= 0
+			CFG_FLIP 		= FALSE
+			CFG_LEFT		= FALSE
+			CFG_UP			= TRUE
+			CFG_FRONT 		= TRUE
+		ENDUSING
+		
+		-- Receieving coordinates
+		WHILE (n_bytes < 6) DO
+			BYTES_AHEAD(sockfd, n_bytes, status)
+		ENDWHILE
+		
+		FOR i = 1 TO 6 DO
+			READ sockfd (coords[i])
+		ENDFOR
+		
+		lin_pos = POS(coords[1], coords[2], coords[3], &
+					  coords[4], coords[5], coords[6], lin_cfg)
+		
+		WRITE(lin_pos, CR)
+		flag = IN_RANGE(lin_pos)
+		WRITE sockfd (flag, CR)
+		
+		IF (flag <> TRUE) THEN
+			WRITE('Position unreachable',CR)
+			RETURN (POS_UR)
+		ENDIF
+
+		-- Receieving speed
+		WHILE (n_bytes <= 0) DO
+			BYTES_AHEAD(sockfd, n_bytes, status)
+		ENDWHILE	
+		
+		READ sockfd (speed)
+		WRITE('Speed = ', speed, CR)
+		
+		-- Receieving termination
+		WHILE (n_bytes <= 0) DO
+			BYTES_AHEAD(sockfd, n_bytes, status)
+		ENDWHILE	
+		
+		READ sockfd (term)
+		WRITE('Termination = CNT', term, CR)		
+		
+		-- sync with TPE program
+		WAIT FOR (FLG[TP_READY_F] = ON)
+		WRITE('Moving..', CR)
+		
+		-- Saving registers
+		-- Set position
+		SET_POS_REG(POS_R, lin_pos, status)
+		IF (status <> S_SUCCESS) THEN 
+			RETURN (-status)
+		ENDIF
+		
+		-- Set speed
+		SET_INT_REG(SPEED_R, speed, status)
+		IF (status <> S_SUCCESS) THEN 
+			RETURN (-status)
+		ENDIF
+		
+		-- Set termination
+		SET_INT_REG(TERM_R, term, status)
+		IF (status <> S_SUCCESS) THEN 
+			RETURN (-status)
+		ENDIF
+		
+		-- Execute
+		FLG[TP_MOVED_F] = ON
+		WAIT FOR (FLG[TP_MOVED_F] = OFF)
+		WRITE('Moving done.', CR)
+		
+		-- Send report
+		WRITE sockfd (EOM, CR)
+		
+		-- Send current position
+		--lin_pos = CURPOS(0, 0)
+		
+		WRITE('Report sended.', CR)		
+		
+	ELSE
+		-- ERROR
+		WRITE('Incorrect type of motion', CR)	
+		RETURN (INCOR_VAL)
+	ENDIF; ENDIF
+
+	RETURN (S_SUCCESS)
+	
+END moving_task
+
+
+-------------------------------------------------------------------------------
+-- This procedure deletes all end-whitespaces from string
+-- 
+-- [in/out] src     		: string for editing
+-------------------------------------------------------------------------------
+ROUTINE spaces_clr
+BEGIN
+	src = SUB_STR(src, 1, STR_LEN(src) - & 
+					(STR_LEN(src) - INDEX(src, ' ') + 1)) -- num of spaces
+	
+END spaces_clr
+
+
+-------------------------------------------------------------------------------
+-- This procedure build info string
+-- 
+-- [out   ] result_str 		: resulting info string 
+--								(Tool Version Robot: RobotNum)
+-------------------------------------------------------------------------------
+ROUTINE info_str
+VAR
+	tmp_str	: STRING[21]
+	entry 	: INTEGER
+	status	: INTEGER
+BEGIN
+	result_str = ''
+	GET_VAR(entry, '*SYSTEM*', '$APPLICATION[1]', tmp_str, status)
+	spaces_clr(tmp_str)
+	result_str = result_str + tmp_str + ' ' 
+	GET_VAR(entry, '*SYSTEM*', '$APPLICATION[2]', tmp_str, status)
+	spaces_clr(tmp_str)
+	result_str = result_str + tmp_str + ' Robot: '
+	GET_VAR(entry, '*SYSTEM*', '$APPLICATION[4]', tmp_str, status)
+	spaces_clr(tmp_str)
+	result_str = result_str + tmp_str 
+	
+END info_str
+
+
+-------------------------------------------------------------------------------
+-- This function build axisnum string
+-- 
+-- [out   ] result_str 		: resulting number of axis as string (AxisNum)
+-- [out   ] 				: number of axis
+-------------------------------------------------------------------------------
+ROUTINE axisnum_str
+VAR
+	tmp_int	: INTEGER
+	entry 	: INTEGER
+	status	: INTEGER
+	
+BEGIN
+	result_str = ''
+	GET_VAR(entry, '*SYSTEM*', '$PARAM_GROUP[1].$AXS_MAP_NUM', &
+			tmp_int, status)
+	CNV_INT_STR(tmp_int, 2, 0, result_str)
+	result_str = SUB_STR(result_str, 2, 1) -- delete first whitespace
+	
+	RETURN(tmp_int)
+	
+END axisnum_str
+
+
+-------------------------------------------------------------------------------
+-- This procedure build axis limit string
+-- 
+-- [out   ] result_str 		: resulting axis limit string (Axislimit)
+-- [in    ] axis_index		: number of axis for what we search limits
+-- [in    ] type_spec		: type of limit: 'L' for lower, 'U' for upper
+-------------------------------------------------------------------------------
+ROUTINE axislim_str
+VAR
+	tmp_rl	: REAL
+	tmp_str	: STRING[8]
+	entry 	: INTEGER
+	status	: INTEGER
+	
+BEGIN
+	result_str = ''
+	CNV_INT_STR(axis_index, 2, 0, tmp_str)
+	tmp_str = SUB_STR(tmp_str, 2, 1) -- delete first whitespace
+
+	IF (type_spec = 'L') THEN
+		GET_VAR(entry, '*SYSTEM*', '$PARAM_GROUP[1].$LOWERLIMS['+tmp_str+']', &
+				tmp_rl, status)
+	ELSE IF (type_spec = 'U') THEN
+		GET_VAR(entry, '*SYSTEM*', '$PARAM_GROUP[1].$UPPERLIMS['+tmp_str+']', &
+				tmp_rl, status)	
+	ELSE
+		WRITE('Incorrect type specifier!', CR)
+	ENDIF; ENDIF
+	
+	CNV_REAL_STR(tmp_rl, 8, 3, tmp_str)
+	tmp_str = SUB_STR(tmp_str, 2, 8) -- delete first whitespace
+	result_str = result_str + tmp_str
+	
+END axislim_str
+
